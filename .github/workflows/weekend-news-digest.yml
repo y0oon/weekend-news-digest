@@ -1,0 +1,42 @@
+name: 週末ニュースダイジェスト 自動生成
+
+on:
+  # 毎週土曜 08:00 JST（= 金曜 23:00 UTC）に実行
+  schedule:
+    - cron: "0 23 * * 5"
+  # 手動実行も可能（テスト用）
+  workflow_dispatch:
+    inputs:
+      no_post:
+        description: "投稿せず生成のみ（true/false）"
+        required: false
+        default: "false"
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依存ライブラリをインストール
+        run: pip install -r requirements.txt
+
+      - name: ダイジェストを生成して下書き投稿
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
+          NO_POST: ${{ github.event.inputs.no_post }}
+        run: |
+          if [ "$NO_POST" = "true" ]; then
+            python3 run.py --no-post
+          else
+            python3 run.py
+          fi

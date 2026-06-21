@@ -1,0 +1,9 @@
+# 認証情報（絶対にコミットしない）
+.env
+
+# 自動生成されたダイジェストHTML（毎週上書き・コミット不要）
+generated/*.html
+
+# Python
+__pycache__/
+*.pyc
