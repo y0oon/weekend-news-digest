@@ -20,22 +20,79 @@ import json
 import os
 import ssl
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 
+import certifi
 from dotenv import load_dotenv
 
 WP_BASE = "https://www.raditech-fire.com"
 ENDPOINT = f"{WP_BASE}/wp-json/wp/v2/posts"
+TAGS_ENDPOINT = f"{WP_BASE}/wp-json/wp/v2/tags"
+
+# 付与するタグ名（無ければ自動作成）
+TAG_NAMES = ["ニュース"]
 
 MAX_ATTEMPTS = 3
 BACKOFF_BASE = 2
 
+# TLS検証は有効。macOS の python.org 版はシステム証明書を見ないため certifi を使う。
+# 本番 www.raditech-fire.com は正規証明書なので検証は無効化しない。
+_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+
 
 def _open(req):
-    """通常はTLS検証あり(create_default_context)で接続する。
-    本番 www.raditech-fire.com は正規証明書なので検証を無効化しない。"""
-    return urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=30)
+    return urllib.request.urlopen(req, context=_SSL_CTX, timeout=30)
+
+
+def _auth_header(user, app_pass):
+    token = base64.b64encode(f"{user}:{app_pass}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def _resolve_tag_ids(names, auth):
+    """タグ名のリストを ID のリストに変換。既存を検索し、無ければ作成する。"""
+    ids = []
+    for name in names:
+        tag_id = None
+        # 1) 既存タグを検索
+        try:
+            q = urllib.parse.urlencode({"search": name, "per_page": 50})
+            req = urllib.request.Request(f"{TAGS_ENDPOINT}?{q}", headers=auth)
+            with _open(req) as res:
+                for t in json.loads(res.read().decode("utf-8")):
+                    if t.get("name") == name:
+                        tag_id = t["id"]
+                        break
+        except Exception as e:  # noqa: BLE001
+            print(f"  [tag] 検索失敗({name}): {e}")
+
+        # 2) 無ければ作成
+        if tag_id is None:
+            try:
+                data = json.dumps({"name": name}).encode("utf-8")
+                headers = {**auth, "Content-Type": "application/json"}
+                req = urllib.request.Request(TAGS_ENDPOINT, data=data, headers=headers, method="POST")
+                with _open(req) as res:
+                    tag_id = json.loads(res.read().decode("utf-8"))["id"]
+                print(f"  [tag] 新規作成: {name} (id={tag_id})")
+            except urllib.error.HTTPError as e:
+                # 競合(term_exists)時は本文から既存IDを拾える場合がある
+                body = e.read().decode("utf-8", "ignore")
+                try:
+                    tag_id = json.loads(body).get("data", {}).get("term_id")
+                except Exception:  # noqa: BLE001
+                    tag_id = None
+                if tag_id is None:
+                    print(f"  [tag] 作成失敗({name}): HTTP {e.code} {body[:160]}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  [tag] 作成失敗({name}): {e}")
+
+        if tag_id is not None:
+            ids.append(tag_id)
+            print(f"  [tag] {name} → id={tag_id}")
+    return ids
 
 
 def post_draft(html, week_label, items=None):
@@ -44,6 +101,12 @@ def post_draft(html, week_label, items=None):
     app_pass = os.getenv("WP_APP_PASS")
     if not user or not app_pass:
         raise SystemExit("Error: WP_USER / WP_APP_PASS が見つかりません（.env または Secrets）")
+
+    auth = _auth_header(user, app_pass)
+
+    # タグ「ニュース」を解決（検索→無ければ作成）
+    print("[post_draft] タグを解決中...")
+    tag_ids = _resolve_tag_ids(TAG_NAMES, auth)
 
     title = f"今週の放射線技師ニュース・週末ダイジェスト（{week_label}）"
     content = f"<!-- wp:html -->\n{html}\n<!-- /wp:html -->"
@@ -54,13 +117,11 @@ def post_draft(html, week_label, items=None):
         "status": "draft",  # ★ 必ず下書き。公開は手動
         "excerpt": f"{week_label}の放射線技師・医療・診療報酬まわりの動きを週末向けにダイジェスト。",
     }
+    if tag_ids:
+        payload["tags"] = tag_ids
     data = json.dumps(payload).encode("utf-8")
 
-    token = base64.b64encode(f"{user}:{app_pass}".encode()).decode()
-    headers = {
-        "Authorization": f"Basic {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {**auth, "Content-Type": "application/json"}
 
     last_err = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -70,7 +131,7 @@ def post_draft(html, week_label, items=None):
                 body = json.loads(res.read().decode("utf-8"))
                 post_id = body.get("id")
                 edit_link = f"{WP_BASE}/wp-admin/post.php?post={post_id}&action=edit"
-                print(f"[post_draft] 下書き作成成功 (ID={post_id})")
+                print(f"[post_draft] 下書き作成成功 (ID={post_id}, tags={tag_ids})")
                 print(f"[post_draft] 編集URL: {edit_link}")
                 return {"id": post_id, "edit_link": edit_link}
         except urllib.error.HTTPError as e:
